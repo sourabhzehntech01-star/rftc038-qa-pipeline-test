@@ -1,0 +1,107 @@
+name: TCM Multi-Suite CI
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  bootstrap-test-ingest:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure python3 + pytest are available
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y python3 python3-pip
+          fi
+          python3 -m pip install --user --quiet pytest
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Create demo project test file
+        run: |
+          mkdir -p demo-project/tests
+          cat > demo-project/tests/test_online_store.py <<'PYEOF'
+          import pytest
+          class Cart:
+              def __init__(self): self.items = []
+              def add(self, name, price): self.items.append((name, price))
+              def remove(self, name): self.items = [i for i in self.items if i[0] != name]
+              @property
+              def count(self): return len(self.items)
+              def total(self): return sum(p for _, p in self.items)
+          def apply_discount(total, code):
+              if code == "SAVE10":
+                  return total  # bug: should be total * 0.9, deliberately broken
+              return total
+          def test_login_valid(): assert True
+          def test_login_invalid_password(): assert True
+          def test_add_item_to_cart():
+              cart = Cart(); cart.add("Blue T-Shirt", 20.0); assert cart.count == 1
+          def test_remove_item_from_cart():
+              cart = Cart(); cart.add("Blue T-Shirt", 20.0); cart.remove("Blue T-Shirt"); assert cart.count == 0
+          def test_apply_discount_code():
+              cart = Cart(); cart.add("Blue T-Shirt", 100.0)
+              final_total = apply_discount(cart.total(), "SAVE10")
+              assert final_total == 90.0, "SAVE10 should have made the total 90.00, but it did not"
+          @pytest.mark.skip(reason="password-reset email is not part of this little demo store")
+          def test_password_reset_email(): assert True
+          PYEOF
+
+      - name: Bootstrap a Run against TCM project 3 (raw curl)
+        env:
+          TCM_BASE_URL: ${{ secrets.TCM_BASE_URL }}
+          TCM_PROJECT_ID: ${{ secrets.TCM_PROJECT_ID }}
+          TCM_API_KEY: ${{ secrets.TCM_API_KEY }}
+        run: |
+          curl -s -H "X-Redmine-API-Key: $TCM_API_KEY" -H "Content-Type: application/json" \
+            -X POST "$TCM_BASE_URL/testcase_ci/bootstrap_run.json" \
+            -d "{\"project_id\":$TCM_PROJECT_ID,\"run\":{\"name\":\"GitHub Actions Build ${{ github.run_number }}\"},\"suites\":[\"Login\",\"Cart Operations\",\"Discounts\"],\"on_existing\":\"suffix\"}" > bootstrap.json
+          cat bootstrap.json
+          RUN_ID=$(python3 -c "import json;print(json.load(open('bootstrap.json'))['run']['id'])")
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+
+      - name: Run tests
+        run: |
+          cd demo-project && python3 -m pytest --junitxml=../report.xml -q || true
+
+      - name: Ingest results (raw curl, parse JUnit with stdlib)
+        env:
+          TCM_BASE_URL: ${{ secrets.TCM_BASE_URL }}
+          TCM_PROJECT_ID: ${{ secrets.TCM_PROJECT_ID }}
+          TCM_API_KEY: ${{ secrets.TCM_API_KEY }}
+          TCM_ENV: ${{ secrets.TCM_ENV }}
+        run: |
+          python3 <<'PYEOF'
+          import xml.etree.ElementTree as ET
+          import json, os
+          tree = ET.parse('report.xml')
+          results = []
+          for tc in tree.iter('testcase'):
+              name = tc.get('name')
+              failure = tc.find('failure'); skipped = tc.find('skipped')
+              if failure is not None:
+                  status = 'failed'; message = failure.get('message', '')
+              elif skipped is not None:
+                  status = 'blocked'; message = skipped.get('message', '')
+              else:
+                  status = 'passed'; message = ''
+              results.append({'key': name, 'status': status, 'message': message})
+          payload = {
+              'project_id': int(os.environ['TCM_PROJECT_ID']),
+              'run_id': int(os.environ['RUN_ID']),
+              'match_by': ['automation_key', 'id'],
+              'environment': os.environ['TCM_ENV'],
+              'auto_defect': True,
+              'results': results,
+          }
+          with open('ingest_payload.json', 'w') as f:
+              json.dump(payload, f)
+          print(f"Parsed {len(results)} JUnit testcases for ingest.")
+          PYEOF
+          cat ingest_payload.json
+          curl -s -H "X-Redmine-API-Key: $TCM_API_KEY" -H "Content-Type: application/json" \
+            -X POST "$TCM_BASE_URL/testcase_ci/ingest_results.json" \
+            -d @ingest_payload.json
+          echo "TCM RUN URL: $TCM_BASE_URL/runs/$RUN_ID?project_id=rftc-038-multisuite-qa"
